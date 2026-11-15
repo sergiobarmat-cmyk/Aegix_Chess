@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ajedrez contra mi IA</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
+<style>
+*{box-sizing:border-box}
+body{font-family:sans-serif;margin:0;padding:12px;background:#1e1e1e;color:#eee;display:flex;flex-direction:column;align-items:center;touch-action:manipulation}
+h1{font-size:20px;margin:6px 0}
+#ctl{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-bottom:6px}
+select,button{font-size:16px;padding:6px 10px}
+#msg{margin:8px 0;font-size:17px;min-height:24px;text-align:center}
+#tab{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));grid-template-rows:repeat(8,minmax(0,1fr));width:min(94vw,480px);height:min(94vw,480px);border:2px solid #555}
+.c{display:flex;align-items:center;justify-content:center;font-size:min(9vw,46px);position:relative;cursor:pointer;user-select:none;overflow:hidden;line-height:1}
+.cl{background:#f0d9b5}
+.os{background:#b58863}
+.bl{color:#fff;text-shadow:0 0 2px #000,0 0 2px #000,0 0 2px #000}
+.ne{color:#000}
+.ul{box-shadow:inset 0 0 0 100px rgba(255,235,59,.45)}
+.jq{box-shadow:inset 0 0 0 100px rgba(244,67,54,.55)}
+.sel{box-shadow:inset 0 0 0 100px rgba(76,175,80,.55)}
+.pt::after{content:"";position:absolute;width:28%;height:28%;border-radius:50%;background:rgba(0,0,0,.35)}
+</style>
+</head>
+<body>
+<h1>Ajedrez contra mi IA</h1>
+<div id="ctl">
+  <label>Juegas con
+    <select id="color"><option value="w">blancas</option><option value="b">negras</option></select>
+  </label>
+  <label>Nivel
+    <select id="nivel"><option value="1">1 (fácil)</option><option value="2" selected>2</option><option value="3">3 (difícil)</option></select>
+  </label>
+  <button id="nueva">Nueva partida</button>
+</div>
+<div id="msg">Cargando la red...</div>
+<div id="tab"></div>
+<script>
+const VALOR = {p:100, n:300, b:320, r:500, q:900, k:0};
+const TIPO = {p:0, n:1, b:2, r:3, q:4, k:5};
+const GL = {p:'♟', n:'♞', b:'♝', r:'♜', q:'♛', k:'♚'};
+const MATE = 100000, MARGEN = 30, TEMP = 0.3, K = 6;
+let PROF = 2;
+const g = new Chess();
+let pesos = null, listo = false, ocupado = false;
+let humano = 'w', sel = null, destinos = [], ultima = null, aviso = '';
+const elTab = document.getElementById('tab');
+const msg = document.getElementById('msg');
+
+/* ---------- Cargar la red ---------- */
+async function cargarPesos(){
+  const resp = await fetch('pesos.bin');
+  if(!resp.ok) throw new Error('No se encuentra pesos.bin');
+  const buf = await resp.arrayBuffer();
+  const tam = [6912,64,36864,64,36864,64,36864,64,4096,4096];
+  const nf = tam.reduce((a,b)=>a+b, 0);
+  if(buf.byteLength !== nf*4 + 4096*4096) throw new Error('pesos.bin está incompleto');
+  const F = new Float32Array(buf, 0, nf);
+  const ps = []; let o = 0;
+  for(const t of tam){ ps.push(F.subarray(o, o+t)); o += t; }
+  pesos = {
+    c: [[ps[0],ps[1]], [ps[2],ps[3]], [ps[4],ps[5]], [ps[6],ps[7]]],
+    esc: ps[8], lb: ps[9], wq: new Int8Array(buf, nf*4)
+  };
+}
+
+/* ---------- La red ---------- */
+const bufIn = new Float32Array(12*100);
+const bufA = new Float32Array(64*100);
+const bufB = new Float32Array(64*100);
+const feat = new Float32Array(4096);
+
+function conv(inp, w, b, ic, out){
+  for(let o=0; o<64; o++){
+    const bo = b[o], ob = o*100;
+    for(let y=0; y<8; y++){
+      for(let x=0; x<8; x++){
+        let s = bo;
+        for(let c=0; c<ic; c++){
+          const wb = (o*ic+c)*9;
+          let r = c*100 + y*10 + x;
+          s += inp[r]*w[wb] + inp[r+1]*w[wb+1] + inp[r+2]*w[wb+2];
+          r += 10;
+          s += inp[r]*w[wb+3] + inp[r+1]*w[wb+4] + inp[r+2]*w[wb+5];
+          r += 10;
+          s += inp[r]*w[wb+6] + inp[r+1]*w[wb+7] + inp[r+2]*w[wb+8];
+        }
+        out[ob + (y+1)*10 + x + 1] = s > 0 ? s : 0;
+      }
+    }
+  }
+}
+
+function planos(){
+  bufIn.fill(0);
+  const turno = g.turn();
+  const tab = g.board();
+  for(let i=0; i<8; i++){
+    for(let j=0; j<8; j++){
+      const p = tab[i][j];
+      if(!p) continue;
+      const canal = TIPO[p.type] + (p.color === turno ? 0 : 6);
+      const fila = (turno === 'w') ? (7-i) : i;
+      bufIn[canal*100 + (fila+1)*10 + (j+1)] = 1;
+    }
+  }
+}
+
+function tronco(){
+  planos();
+  conv(bufIn, pesos.c[0][0], pesos.c[0][1], 12, bufA);
+  conv(bufA, pesos.c[1][0], pesos.c[1][1], 64, bufB);
+  conv(bufB, pesos.c[2][0], pesos.c[2][1], 64, bufA);
+  conv(bufA, pesos.c[3][0], pesos.c[3][1], 64, bufB);
+  for(let c=0; c<64; c++)
+    for(let y=0; y<8; y++)
+      for(let x=0; x<8; x++)
+        feat[c*64 + y*8 + x] = bufB[c*100 + (y+1)*10 + x + 1];
+}
+
+function casilla(n){ return (n.charCodeAt(1)-49)*8 + (n.charCodeAt(0)-97); }
+
+function indiceJugada(m, turno){
+  let d = casilla(m.from), h = casilla(m.to);
+  if(turno === 'b'){ d ^= 56; h ^= 56; }
+  return d*64 + h;
+}
+
+function logit(idx){
+  const base = idx*4096, wq = pesos.wq;
+  let s = 0;
+  for(let i=0; i<4096; i++) s += wq[base+i]*feat[i];
+  return pesos.lb[idx] + pesos.esc[idx]*s;
+}
+
+/* ---------- Búsqueda ---------- */
+function ordenar(){
+  const legales = g.moves({verbose:true}).filter(m => !m.promotion || m.promotion === 'q');
+  if(!legales.length) return [];
+  tronco();
+  const turno = g.turn();
+  const pares = legales.map(m => ({l: logit(indiceJugada(m, turno)), m: m}));
+  pares.sort((a,b) => b.l - a.l);
+  return pares;
+}
+
+function sinDefensa(m){
+  g.move(m);
+  const rec = g.moves({verbose:true}).some(x => x.to === m.to && x.captured);
+  g.undo();
+  return !rec;
+}
+
+function seleccionar(pares, k){
+  const res = pares.slice(0, k).map(p => p.m);
+  for(let i=k; i<pares.length; i++){
+    const m = pares[i].m;
+    if(m.captured && (VALOR[m.captured] >= VALOR[m.piece] || sinDefensa(m))) res.push(m);
+  }
+  return res;
+}
+
+function material(){
+  const turno = g.turn();
+  let s = 0;
+  for(const fila of g.board()){
+    for(const p of fila){
+      if(p) s += (p.color === turno ? 1 : -1) * VALOR[p.type];
+    }
+  }
+  return s;
+}
+
+function ordenCaptura(m){ return (m.captured ? VALOR[m.captured]*10 : 0) - VALOR[m.piece]; }
+
+function quiescencia(alpha, beta, prof){
+  if(prof === 0) return material();
+  let movs, mejor;
+  const enJaque = g.in_check();
+  const todas = g.moves({verbose:true});
+  if(enJaque){
+    if(!todas.length) return -MATE;
+    movs = todas.filter(m => !m.promotion || m.promotion === 'q');
+    mejor = -2*MATE;
+  } else {
+    mejor = material();
+    if(mejor >= beta) return mejor;
+    if(mejor > alpha) alpha = mejor;
+    movs = todas.filter(m => m.captured && (!m.promotion || m.promotion === 'q'));
+  }
+  movs.sort((a,b) => ordenCaptura(b) - ordenCaptura(a));
+  for(const m of movs){
+    g.move(m);
+    const v = -quiescencia(-beta, -alpha, prof-1);
+    g.undo();
+    if(v > mejor) mejor = v;
+    if(mejor > alpha) alpha = mejor;
+    if(alpha >= beta) break;
+  }
+  return mejor;
+}
+
+function buscar(prof, alpha, beta){
+  if(prof === 0) return quiescencia(alpha, beta, 3);
+  const pares = ordenar();
+  if(!pares.length) return g.in_check() ? (-MATE - prof) : 0;
+  if(g.insufficient_material()) return 0;
+  let mejor = -2*MATE;
+  for(const m of seleccionar(pares, K)){
+    g.move(m);
+    const v = -buscar(prof-1, -beta, -alpha);
+    g.undo();
+    if(v > mejor) mejor = v;
+    if(mejor > alpha) alpha = mejor;
+    if(alpha >= beta) break;
+  }
+  return mejor;
+}
+
+function elegirJugada(){
+  const pares = ordenar();
+  const logits = new Map(pares.map(p => [p.m, p.l]));
+  const cand = seleccionar(pares, K + 4);
+  const res = [];
+  for(const m of cand){
+    g.move(m);
+    const v = -buscar(PROF - 1, -2*MATE, 2*MATE);
+    g.undo();
+    res.push({v: v, m: m});
+  }
+  let mejor = -Infinity;
+  for(const r of res) if(r.v > mejor) mejor = r.v;
+  const buenas = res.filter(r => r.v >= mejor - MARGEN).map(r => ({l: logits.get(r.m), m: r.m}));
+  let mx = -Infinity;
+  for(const b of buenas) if(b.l > mx) mx = b.l;
+  const pr = buenas.map(b => Math.exp((b.l - mx) / TEMP));
+  let tot = 0;
+  for(const x of pr) tot += x;
+  let azar = Math.random() * tot;
+  for(let i=0; i<buenas.length; i++){
+    azar -= pr[i];
+    if(azar <= 0) return buenas[i].m;
+  }
+  return buenas[buenas.length-1].m;
+}
+
+/* ---------- Interfaz ---------- */
+function casillaRey(color){
+  const tab = g.board();
+  for(let i=0; i<8; i++){
+    for(let j=0; j<8; j++){
+      const p = tab[i][j];
+      if(p && p.type === 'k' && p.color === color) return 'abcdefgh'[j] + (8-i);
+    }
+  }
+  return null;
+}
+
+function textoFin(){
+  if(g.in_checkmate()){
+    const gananBlancas = g.turn() === 'b';
+    const humanoGana = (gananBlancas && humano === 'w') || (!gananBlancas && humano === 'b');
+    return humanoGana ? 'Jaque mate: ¡has ganado!' : 'Jaque mate: gana la IA';
+  }
+  if(g.game_over()) return 'Fin de la partida: tablas';
+  return '';
+}
+
+function pintar(){
+  const tab = g.board();
+  const flip = humano === 'b';
+  const jaqueSq = g.in_check() ? casillaRey(g.turn()) : null;
+  elTab.innerHTML = '';
+  for(let r=0; r<8; r++){
+    for(let c=0; c<8; c++){
+      const f = flip ? 7-c : c;
+      const rk = flip ? r+1 : 8-r;
+      const nombre = 'abcdefgh'[f] + rk;
+      const p = tab[8-rk][f];
+      const d = document.createElement('div');
+      d.className = 'c ' + (((f + rk) % 2 === 0) ? 'cl' : 'os');
+      if(p){
+        d.textContent = GL[p.type] + '\uFE0E';
+        d.classList.add(p.color === 'w' ? 'bl' : 'ne');
+      }
+      if(ultima && (ultima.from === nombre || ultima.to === nombre)) d.classList.add('ul');
+      if(jaqueSq === nombre) d.classList.add('jq');
+      if(sel === nombre) d.classList.add('sel');
+      if(sel && destinos.includes(nombre)) d.classList.add('pt');
+      d.onclick = () => clic(nombre);
+      elTab.appendChild(d);
+    }
+  }
+  if(aviso) msg.textContent = aviso;
+  else if(!listo) msg.textContent = 'Cargando la red...';
+  else if(g.game_over()) msg.textContent = textoFin();
+  else if(ocupado) msg.textContent = 'La IA está pensando...';
+  else msg.textContent = 'Te toca a ti' + (g.in_check() ? ' (jaque)' : '');
+}
+
+function clic(nombre){
+  if(!listo || ocupado || g.game_over() || g.turn() !== humano) return;
+  if(sel && destinos.includes(nombre)){
+    ultima = g.move({from: sel, to: nombre, promotion: 'q'});
+    sel = null; destinos = [];
+    ocupado = true;
+    pintar();
+    setTimeout(turnoIA, 50);
+    return;
+  }
+  const p = g.get(nombre);
+  if(p && p.color === humano){
+    sel = nombre;
+    destinos = g.moves({square: nombre, verbose: true}).map(m => m.to);
+  } else {
+    sel = null; destinos = [];
+  }
+  pintar();
+}
+
+function turnoIA(){
+  try{
+    PROF = +document.getElementById('nivel').value;
+    if(!g.game_over() && g.turn() !== humano){
+      const m = elegirJugada();
+      ultima = g.move(m);
+    }
+  } catch(e){
+    aviso = 'Error: ' + e;
+  }
+  ocupado = false;
+  pintar();
+}
+
+function nueva(){
+  if(!listo) return;
+  g.reset();
+  ultima = null; sel = null; destinos = []; aviso = '';
+  humano = document.getElementById('color').value;
+  if(humano === 'b'){
+    ocupado = true;
+    pintar();
+    setTimeout(turnoIA, 50);
+  } else {
+    ocupado = false;
+    pintar();
+  }
+}
+
+document.getElementById('nueva').onclick = nueva;
+pintar();
+cargarPesos().then(() => { listo = true; nueva(); })
+  .catch(e => { aviso = 'Error al cargar: ' + e; pintar(); });
+</script>
+</body>
+</html>
