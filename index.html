@@ -353,6 +353,55 @@ document.getElementById('nueva').onclick = nueva;
 pintar();
 cargarPesos().then(() => { listo = true; nueva(); })
   .catch(e => { aviso = 'Error al cargar: ' + e; pintar(); });
+
+/* ===== Modo IA contra IA ===== */
+let espectador = false, ronda = 0;
+
+document.getElementById('ctl').insertAdjacentHTML('beforeend',
+  '<button id="ia2">IA vs IA</button>' +
+  '<label>Blancas <select id="nivelB"><option value="1">1</option><option value="2" selected>2</option><option value="3">3</option></select></label>' +
+  '<label>Negras <select id="nivelN"><option value="1">1</option><option value="2" selected>2</option><option value="3">3</option></select></label>');
+
+function textoEspectador(){
+  if(g.in_checkmate()) return 'Jaque mate: ganan las ' + (g.turn() === 'b' ? 'blancas' : 'negras');
+  if(g.game_over()) return 'Fin de la partida: tablas';
+  return 'IA vs IA: mueven las ' + (g.turn() === 'w' ? 'blancas' : 'negras');
+}
+
+function jugarEspectador(id){
+  if(id !== ronda || !espectador) return;
+  PROF = +document.getElementById(g.turn() === 'w' ? 'nivelB' : 'nivelN').value;
+  try {
+    ultima = g.move(elegirJugada());
+  } catch(e){
+    espectador = false; ocupado = false; aviso = 'Error: ' + e;
+    pintar();
+    return;
+  }
+  pintar();
+  msg.textContent = textoEspectador();
+  if(g.game_over()){ espectador = false; ocupado = false; return; }
+  setTimeout(() => jugarEspectador(id), 300);
+}
+
+function iniciarEspectador(){
+  if(!listo) return;
+  if(ocupado && !espectador) return;
+  ronda++;
+  const id = ronda;
+  espectador = true;
+  ocupado = true;
+  g.reset(); ultima = null; sel = null; destinos = []; aviso = ''; humano = 'w';
+  pintar();
+  msg.textContent = textoEspectador();
+  setTimeout(() => jugarEspectador(id), 400);
+}
+
+// "Nueva partida" también detiene el modo IA vs IA
+const nuevaOriginal = nueva;
+nueva = function(){ espectador = false; ronda++; nuevaOriginal(); };
+document.getElementById('nueva').onclick = nueva;
+document.getElementById('ia2').onclick = iniciarEspectador;
 </script>
 </body>
 </html>
